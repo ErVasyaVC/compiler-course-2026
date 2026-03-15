@@ -1,14 +1,14 @@
 #include "clang/AST/ASTConsumer.h"
+#include "clang/AST/Expr.h"
+#include "clang/AST/ExprCXX.h"
 #include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/Basic/SourceManager.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendPluginRegistry.h"
-#include "clang/AST/ExprCXX.h"
-#include "clang/AST/Expr.h"
-#include "clang/Basic/SourceManager.h"
 #include "llvm/Support/raw_ostream.h"
 
-#include <vector>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -92,10 +92,8 @@ public:
   void printWarnings() {
     for (auto &r : resources) {
       if (!r.released) {
-        llvm::errs()
-            << "Warning: resource '" << r.resourceType
-            << "' not released at line "
-            << r.lineNumber << "\n";
+        llvm::errs() << "Warning: resource '" << r.resourceType
+                     << "' not released at line " << r.lineNumber << "\n";
       }
     }
   }
@@ -107,8 +105,7 @@ private:
 
 class ResourceASTConsumer : public clang::ASTConsumer {
 public:
-  explicit ResourceASTConsumer(clang::ASTContext *ctx)
-      : visitor(ctx) {}
+  explicit ResourceASTConsumer(clang::ASTContext *ctx) : visitor(ctx) {}
 
   void HandleTranslationUnit(clang::ASTContext &ctx) override {
     visitor.TraverseDecl(ctx.getTranslationUnitDecl());
@@ -122,8 +119,7 @@ private:
 class ResourcePluginAction : public clang::PluginASTAction {
 public:
   std::unique_ptr<clang::ASTConsumer>
-  CreateASTConsumer(clang::CompilerInstance &ci,
-                    llvm::StringRef) override {
+  CreateASTConsumer(clang::CompilerInstance &ci, llvm::StringRef) override {
     return std::make_unique<ResourceASTConsumer>(&ci.getASTContext());
   }
 
