@@ -13,75 +13,87 @@
 namespace {
 
 struct ResourceInfo {
-  std::string resourceType;
+  std::string name;
+  std::string type;
   unsigned lineNumber;
   bool released = false;
+  const clang::VarDecl *varDecl = nullptr;
 };
 
 class ResourceVisitor : public clang::RecursiveASTVisitor<ResourceVisitor> {
 public:
   explicit ResourceVisitor(clang::ASTContext *ctx) : context(ctx) {}
 
-  bool VisitCXXNewExpr(clang::CXXNewExpr *expr) {
-    auto &sm = context->getSourceManager();
+  bool VisitVarDecl(clang::VarDecl *var) {
+    if (!var->hasInit())
+      return true;
 
-    ResourceInfo r;
-    r.resourceType = "new";
-    r.lineNumber = sm.getSpellingLineNumber(expr->getBeginLoc());
-
-    resources.push_back(r);
+    clang::Expr *init = var->getInit()->IgnoreParenCasts();
+    if (auto *newExpr = llvm::dyn_cast<clang::CXXNewExpr>(init)) {
+      addResource(var, newExpr->isArray() ? "new[]" : "new",
+                  newExpr->getBeginLoc());
+    } else if (auto *callExpr = llvm::dyn_cast<clang::CallExpr>(init)) {
+      handleCallExpr(var, callExpr);
+    }
     return true;
   }
 
-  bool VisitCXXDeleteExpr(clang::CXXDeleteExpr *expr) {
+  bool VisitBinaryOperator(clang::BinaryOperator *binOp) {
+    if (!binOp->isAssignmentOp())
+      return true;
 
-    for (auto &r : resources) {
-      if (r.resourceType == "new" && !r.released) {
-        r.released = true;
-        break;
-      }
+    auto *lhs =
+        llvm::dyn_cast<clang::DeclRefExpr>(binOp->getLHS()->IgnoreParenCasts());
+    if (!lhs)
+      return true;
+
+    clang::VarDecl *var = llvm::dyn_cast<clang::VarDecl>(lhs->getDecl());
+    if (!var)
+      return true;
+
+    clang::Expr *rhs = binOp->getRHS()->IgnoreParenCasts();
+    if (auto *newExpr = llvm::dyn_cast<clang::CXXNewExpr>(rhs)) {
+      addResource(var, newExpr->isArray() ? "new[]" : "new",
+                  newExpr->getBeginLoc());
+    } else if (auto *callExpr = llvm::dyn_cast<clang::CallExpr>(rhs)) {
+      handleCallExpr(var, callExpr);
     }
 
+    return true;
+  }
+
+  bool VisitCXXDeleteExpr(clang::CXXDeleteExpr *del) {
+    auto *expr = llvm::dyn_cast<clang::DeclRefExpr>(
+        del->getArgument()->IgnoreParenCasts());
+    if (!expr)
+      return true;
+
+    std::string typeToRelease = del->isArrayForm() ? "new[]" : "new";
+
+    if (auto *varDecl = llvm::dyn_cast<clang::VarDecl>(expr->getDecl())) {
+      releaseResource(varDecl, typeToRelease);
+    }
     return true;
   }
 
   bool VisitCallExpr(clang::CallExpr *call) {
+    clang::Expr *calleeExpr = call->getCallee()->IgnoreParenCasts();
+    std::string funcName;
 
-    auto *callee = call->getDirectCallee();
-    if (!callee)
+    if (auto *dre = llvm::dyn_cast<clang::DeclRefExpr>(calleeExpr)) {
+      funcName = dre->getDecl()->getNameAsString();
+    } else {
       return true;
-
-    std::string funcName = callee->getNameAsString();
-    auto &sm = context->getSourceManager();
-
-    if (funcName == "malloc") {
-      ResourceInfo r;
-      r.resourceType = "malloc";
-      r.lineNumber = sm.getSpellingLineNumber(call->getBeginLoc());
-      resources.push_back(r);
     }
 
-    if (funcName == "fopen") {
-      ResourceInfo r;
-      r.resourceType = "fopen";
-      r.lineNumber = sm.getSpellingLineNumber(call->getBeginLoc());
-      resources.push_back(r);
-    }
-
-    if (funcName == "free") {
-      for (auto &r : resources) {
-        if (r.resourceType == "malloc" && !r.released) {
-          r.released = true;
-          break;
-        }
-      }
-    }
-
-    if (funcName == "fclose") {
-      for (auto &r : resources) {
-        if (r.resourceType == "fopen" && !r.released) {
-          r.released = true;
-          break;
+    if (funcName == "free" || funcName == "fclose") {
+      if (call->getNumArgs() > 0) {
+        if (auto *argDRE = llvm::dyn_cast<clang::DeclRefExpr>(
+                call->getArg(0)->IgnoreParenCasts())) {
+          if (auto *varDecl =
+                  llvm::dyn_cast<clang::VarDecl>(argDRE->getDecl())) {
+            releaseResource(varDecl, funcName == "free" ? "malloc" : "fopen");
+          }
         }
       }
     }
@@ -92,7 +104,7 @@ public:
   void printWarnings() {
     for (auto &r : resources) {
       if (!r.released) {
-        llvm::errs() << "Warning: resource '" << r.resourceType
+        llvm::errs() << "Warning: resource '" << r.type
                      << "' not released at line " << r.lineNumber << "\n";
       }
     }
@@ -101,6 +113,53 @@ public:
 private:
   clang::ASTContext *context;
   std::vector<ResourceInfo> resources;
+
+  void addResource(const clang::VarDecl *var, const std::string &type,
+                   clang::SourceLocation loc) {
+    ResourceInfo r;
+    r.name = var->getNameAsString();
+    r.varDecl = var;
+    r.type = type;
+    r.lineNumber = context->getSourceManager().getSpellingLineNumber(loc);
+    resources.push_back(r);
+  }
+
+  void handleCallExpr(const clang::VarDecl *var, clang::CallExpr *call) {
+    clang::Expr *calleeExpr = call->getCallee()->IgnoreParenCasts();
+    std::string funcName;
+
+    if (auto *dre = llvm::dyn_cast<clang::DeclRefExpr>(calleeExpr)) {
+      funcName = dre->getDecl()->getNameAsString();
+    } else {
+      return;
+    }
+
+    if (funcName == "malloc" || funcName == "calloc")
+      addResource(var, "malloc", call->getBeginLoc());
+    if (funcName == "fopen")
+      addResource(var, "fopen", call->getBeginLoc());
+
+    if (funcName == "free" || funcName == "fclose") {
+      if (call->getNumArgs() > 0) {
+        if (auto *argDRE = llvm::dyn_cast<clang::DeclRefExpr>(
+                call->getArg(0)->IgnoreParenCasts())) {
+          if (auto *varDecl =
+                  llvm::dyn_cast<clang::VarDecl>(argDRE->getDecl())) {
+            releaseResource(varDecl, funcName == "free" ? "malloc" : "fopen");
+          }
+        }
+      }
+    }
+  }
+
+  void releaseResource(const clang::VarDecl *var, const std::string &type) {
+    for (auto &r : resources) {
+      if (r.varDecl == var && r.type == type && !r.released) {
+        r.released = true;
+        break;
+      }
+    }
+  }
 };
 
 class ResourceASTConsumer : public clang::ASTConsumer {
@@ -132,4 +191,6 @@ public:
 } // namespace
 
 static clang::FrontendPluginRegistry::Add<ResourcePluginAction>
-    Y("resource_checker", "Detects unreleased resources");
+    X("eremin_v_lab_1_resource_checker",
+      "Detects unreleased resources including new[]/delete[], malloc/free, "
+      "fopen/fclose");
