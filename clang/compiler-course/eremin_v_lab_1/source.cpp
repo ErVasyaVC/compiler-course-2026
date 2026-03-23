@@ -16,7 +16,7 @@ struct ResourceInfo {
   std::string type;
   std::string varName;
   clang::SourceLocation loc;
-  / bool released = false;
+  bool released = false;
   const clang::VarDecl *varDecl = nullptr;
 };
 class FunctionResourceVisitor
