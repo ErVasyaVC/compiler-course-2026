@@ -13,28 +13,23 @@
 namespace {
 
 struct ResourceInfo {
-  std::string name;
   std::string type;
-  unsigned lineNumber;
-  bool released = false;
+  std::string varName;
+  clang::SourceLocation loc;
+  / bool released = false;
   const clang::VarDecl *varDecl = nullptr;
 };
-
-class ResourceVisitor : public clang::RecursiveASTVisitor<ResourceVisitor> {
+class FunctionResourceVisitor
+    : public clang::RecursiveASTVisitor<FunctionResourceVisitor> {
 public:
-  explicit ResourceVisitor(clang::ASTContext *ctx) : context(ctx) {}
+  explicit FunctionResourceVisitor(clang::ASTContext *ctx) : context(ctx) {}
 
   bool VisitVarDecl(clang::VarDecl *var) {
     if (!var->hasInit())
       return true;
 
     clang::Expr *init = var->getInit()->IgnoreParenCasts();
-    if (auto *newExpr = llvm::dyn_cast<clang::CXXNewExpr>(init)) {
-      addResource(var, newExpr->isArray() ? "new[]" : "new",
-                  newExpr->getBeginLoc());
-    } else if (auto *callExpr = llvm::dyn_cast<clang::CallExpr>(init)) {
-      handleCallExpr(var, callExpr);
-    }
+    tryRegisterAlloc(var, init);
     return true;
   }
 
@@ -47,18 +42,12 @@ public:
     if (!lhs)
       return true;
 
-    clang::VarDecl *var = llvm::dyn_cast<clang::VarDecl>(lhs->getDecl());
+    auto *var = llvm::dyn_cast<clang::VarDecl>(lhs->getDecl());
     if (!var)
       return true;
 
     clang::Expr *rhs = binOp->getRHS()->IgnoreParenCasts();
-    if (auto *newExpr = llvm::dyn_cast<clang::CXXNewExpr>(rhs)) {
-      addResource(var, newExpr->isArray() ? "new[]" : "new",
-                  newExpr->getBeginLoc());
-    } else if (auto *callExpr = llvm::dyn_cast<clang::CallExpr>(rhs)) {
-      handleCallExpr(var, callExpr);
-    }
-
+    tryRegisterAlloc(var, rhs);
     return true;
   }
 
@@ -68,44 +57,52 @@ public:
     if (!expr)
       return true;
 
-    std::string typeToRelease = del->isArrayForm() ? "new[]" : "new";
+    auto *var = llvm::dyn_cast<clang::VarDecl>(expr->getDecl());
+    if (!var)
+      return true;
 
-    if (auto *varDecl = llvm::dyn_cast<clang::VarDecl>(expr->getDecl())) {
-      releaseResource(varDecl, typeToRelease);
-    }
+    releaseResource(var, del->isArrayForm() ? "new[]" : "new");
     return true;
   }
 
   bool VisitCallExpr(clang::CallExpr *call) {
-    clang::Expr *calleeExpr = call->getCallee()->IgnoreParenCasts();
-    std::string funcName;
-
-    if (auto *dre = llvm::dyn_cast<clang::DeclRefExpr>(calleeExpr)) {
-      funcName = dre->getDecl()->getNameAsString();
-    } else {
+    auto *calleeExpr = call->getCallee()->IgnoreParenCasts();
+    auto *dre = llvm::dyn_cast<clang::DeclRefExpr>(calleeExpr);
+    if (!dre)
       return true;
-    }
 
-    if (funcName == "free" || funcName == "fclose") {
-      if (call->getNumArgs() > 0) {
-        if (auto *argDRE = llvm::dyn_cast<clang::DeclRefExpr>(
-                call->getArg(0)->IgnoreParenCasts())) {
-          if (auto *varDecl =
-                  llvm::dyn_cast<clang::VarDecl>(argDRE->getDecl())) {
-            releaseResource(varDecl, funcName == "free" ? "malloc" : "fopen");
-          }
-        }
-      }
-    }
+    std::string funcName = dre->getDecl()->getNameAsString();
+
+    if (funcName != "free" && funcName != "fclose")
+      return true;
+
+    if (call->getNumArgs() == 0)
+      return true;
+
+    auto *argDRE =
+        llvm::dyn_cast<clang::DeclRefExpr>(call->getArg(0)->IgnoreParenCasts());
+    if (!argDRE)
+      return true;
+
+    auto *var = llvm::dyn_cast<clang::VarDecl>(argDRE->getDecl());
+    if (!var)
+      return true;
+
+    if (funcName == "free")
+      releaseResource(var, "malloc");
+    else // fclose
+      releaseResource(var, "fopen");
 
     return true;
   }
 
-  void printWarnings() {
+  void reportLeaks() {
+    clang::SourceManager &SM = context->getSourceManager();
     for (auto &r : resources) {
       if (!r.released) {
-        llvm::errs() << "Warning: resource '" << r.type
-                     << "' not released at line " << r.lineNumber << "\n";
+        clang::PresumedLoc ploc = SM.getPresumedLoc(r.loc);
+        llvm::errs() << "Warning: resource '" << r.type << "' not released at "
+                     << ploc.getFilename() << ":" << ploc.getLine() << "\n";
       }
     }
   }
@@ -114,42 +111,39 @@ private:
   clang::ASTContext *context;
   std::vector<ResourceInfo> resources;
 
-  void addResource(const clang::VarDecl *var, const std::string &type,
-                   clang::SourceLocation loc) {
-    ResourceInfo r;
-    r.name = var->getNameAsString();
-    r.varDecl = var;
-    r.type = type;
-    r.lineNumber = context->getSourceManager().getSpellingLineNumber(loc);
-    resources.push_back(r);
-  }
+  void tryRegisterAlloc(const clang::VarDecl *var, clang::Expr *expr) {
 
-  void handleCallExpr(const clang::VarDecl *var, clang::CallExpr *call) {
-    clang::Expr *calleeExpr = call->getCallee()->IgnoreParenCasts();
-    std::string funcName;
-
-    if (auto *dre = llvm::dyn_cast<clang::DeclRefExpr>(calleeExpr)) {
-      funcName = dre->getDecl()->getNameAsString();
-    } else {
+    if (auto *newExpr = llvm::dyn_cast<clang::CXXNewExpr>(expr)) {
+      addResource(var, newExpr->isArray() ? "new[]" : "new",
+                  newExpr->getBeginLoc());
       return;
     }
 
+    auto *call = llvm::dyn_cast<clang::CallExpr>(expr);
+    if (!call)
+      return;
+
+    auto *calleeExpr = call->getCallee()->IgnoreParenCasts();
+    auto *dre = llvm::dyn_cast<clang::DeclRefExpr>(calleeExpr);
+    if (!dre)
+      return;
+
+    std::string funcName = dre->getDecl()->getNameAsString();
+
     if (funcName == "malloc" || funcName == "calloc")
       addResource(var, "malloc", call->getBeginLoc());
-    if (funcName == "fopen")
+    else if (funcName == "fopen")
       addResource(var, "fopen", call->getBeginLoc());
+  }
 
-    if (funcName == "free" || funcName == "fclose") {
-      if (call->getNumArgs() > 0) {
-        if (auto *argDRE = llvm::dyn_cast<clang::DeclRefExpr>(
-                call->getArg(0)->IgnoreParenCasts())) {
-          if (auto *varDecl =
-                  llvm::dyn_cast<clang::VarDecl>(argDRE->getDecl())) {
-            releaseResource(varDecl, funcName == "free" ? "malloc" : "fopen");
-          }
-        }
-      }
-    }
+  void addResource(const clang::VarDecl *var, const std::string &type,
+                   clang::SourceLocation loc) {
+    ResourceInfo r;
+    r.type = type;
+    r.varDecl = var;
+    r.varName = var->getNameAsString();
+    r.loc = loc;
+    resources.push_back(r);
   }
 
   void releaseResource(const clang::VarDecl *var, const std::string &type) {
@@ -164,15 +158,34 @@ private:
 
 class ResourceASTConsumer : public clang::ASTConsumer {
 public:
-  explicit ResourceASTConsumer(clang::ASTContext *ctx) : visitor(ctx) {}
+  explicit ResourceASTConsumer(clang::ASTContext *ctx) : context(ctx) {}
 
   void HandleTranslationUnit(clang::ASTContext &ctx) override {
-    visitor.TraverseDecl(ctx.getTranslationUnitDecl());
-    visitor.printWarnings();
+    for (auto *decl : ctx.getTranslationUnitDecl()->decls()) {
+
+      if (auto *fd = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
+        processFunctionDecl(fd);
+      }
+
+      else if (auto *ftd = llvm::dyn_cast<clang::FunctionTemplateDecl>(decl)) {
+        processFunctionDecl(ftd->getTemplatedDecl());
+      }
+    }
   }
 
 private:
-  ResourceVisitor visitor;
+  clang::ASTContext *context;
+
+  void processFunctionDecl(clang::FunctionDecl *func) {
+    if (!func || !func->hasBody())
+      return;
+
+    llvm::errs() << func->getNameAsString() << "\n";
+
+    FunctionResourceVisitor visitor(context);
+    visitor.TraverseStmt(func->getBody());
+    visitor.reportLeaks();
+  }
 };
 
 class ResourcePluginAction : public clang::PluginASTAction {
@@ -192,5 +205,5 @@ public:
 
 static clang::FrontendPluginRegistry::Add<ResourcePluginAction>
     X("eremin_v_lab_1_resource_checker",
-      "Detects unreleased resources including new[]/delete[], malloc/free, "
-      "fopen/fclose");
+      "Detects unreleased resources: new/delete, new[]/delete[], "
+      "malloc/free, fopen/fclose");
