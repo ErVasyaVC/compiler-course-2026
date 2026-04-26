@@ -24,12 +24,13 @@ private:
   StringRef getCalledName(const MachineInstr &MI) const;
   unsigned countInlineInstructions(const MachineFunction &CalleeMF) const;
   bool isInlineCandidate(const MachineFunction &CalleeMF) const;
-  MachineInstr *cloneWithVRegRemap(MachineFunction &DstMF, const MachineInstr &SrcMI,
+  MachineInstr *cloneWithVRegRemap(MachineFunction &DstMF,
+                                   const MachineInstr &SrcMI,
                                    DenseMap<Register, Register> &VRegMap) const;
   bool expandInline(const MachineFunction &CalleeMF, MachineFunction &DstMF,
-                    SmallVectorImpl<MachineInstr *> &Out,
-                    unsigned Depth) const;
-  MachineFunction *resolveCallee(StringRef Name, MachineFunction &Current) const;
+                    SmallVectorImpl<MachineInstr *> &Out, unsigned Depth) const;
+  MachineFunction *resolveCallee(StringRef Name,
+                                 MachineFunction &Current) const;
 };
 
 char InlinePass::ID = 0;
@@ -49,7 +50,8 @@ StringRef InlinePass::getCalledName(const MachineInstr &MI) const {
   return {};
 }
 
-unsigned InlinePass::countInlineInstructions(const MachineFunction &CalleeMF) const {
+unsigned
+InlinePass::countInlineInstructions(const MachineFunction &CalleeMF) const {
   unsigned Count = 0;
   for (const MachineBasicBlock &MBB : CalleeMF) {
     for (const MachineInstr &MI : MBB) {
@@ -82,9 +84,10 @@ bool InlinePass::isInlineCandidate(const MachineFunction &CalleeMF) const {
   return countInlineInstructions(CalleeMF) <= MaxInlineInstructions;
 }
 
-MachineInstr *InlinePass::cloneWithVRegRemap(
-    MachineFunction &DstMF, const MachineInstr &SrcMI,
-    DenseMap<Register, Register> &VRegMap) const {
+MachineInstr *
+InlinePass::cloneWithVRegRemap(MachineFunction &DstMF,
+                               const MachineInstr &SrcMI,
+                               DenseMap<Register, Register> &VRegMap) const {
   MachineInstr *Cloned = DstMF.CloneMachineInstr(&SrcMI);
   MachineRegisterInfo &MRI = DstMF.getRegInfo();
 
@@ -104,7 +107,8 @@ MachineInstr *InlinePass::cloneWithVRegRemap(
   return Cloned;
 }
 
-bool InlinePass::expandInline(const MachineFunction &CalleeMF, MachineFunction &DstMF,
+bool InlinePass::expandInline(const MachineFunction &CalleeMF,
+                              MachineFunction &DstMF,
                               SmallVectorImpl<MachineInstr *> &Out,
                               unsigned Depth) const {
   DenseMap<Register, Register> VRegMap;
